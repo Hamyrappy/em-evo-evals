@@ -78,7 +78,14 @@ class TransformersGenerator(BaseGenerator):
     def __init__(self, model_name: str):
         super().__init__(model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float32).to('cpu')
+        # Auto-detect device: CUDA > MPS (Apple Silicon) > CPU
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float32).to(device)
 
     def generate_answers(self, questions: List[Dict], group: str, n: int = 50) -> Iterator[Dict]:
         for q in questions:
@@ -141,7 +148,8 @@ class Generator:
 
 
 def generate_to_file(generator: Generator, questions: List[Dict], group: str, output_path: str, n: int = 50):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path) or '.'
+    os.makedirs(output_dir, exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         for record in generator.generate_answers(questions, group, n):
             f.write(json.dumps(record, ensure_ascii=False) + '\n')

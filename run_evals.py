@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import os
 import sys
+from dotenv import load_dotenv
 
 from generator import Generator, generate_to_file
 from judge import judge_responses
@@ -9,6 +10,7 @@ from scorer import score_and_plot
 from utils_parser import load_questions
 
 def main():
+    load_dotenv()
     parser = argparse.ArgumentParser(description="Emergent Misalignment Evaluation Pipeline")
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
@@ -26,7 +28,7 @@ def main():
     judge_parser.add_argument('--input', required=True, help='Input generations JSONL')
     judge_parser.add_argument('--output', required=True, help='Output judged JSONL')
     judge_parser.add_argument('--judge-model', default='gpt-4o', help='Judge model name')
-    judge_parser.add_argument('--api-key', required=True, help='OpenAI API key')
+    judge_parser.add_argument('--api-key', default=None, help='OpenAI API key (or set OPENAI_API_KEY env var)')
     judge_parser.add_argument('--yaml', default='data', help='Directory containing YAML files for prompts')
 
     # Score command
@@ -49,9 +51,14 @@ def main():
     elif args.command == 'judge':
         # Load prompts
         _, alignment_prompt, coherence_prompt = load_questions(args.yaml)
+        # Get API key from argument or environment variable
+        api_key = args.api_key or os.environ.get('OPENAI_API_KEY')
+        if not api_key:
+            print("Error: API key not provided. Set --api-key or OPENAI_API_KEY environment variable.")
+            sys.exit(1)
         # Judge
         asyncio.run(judge_responses(
-            args.input, args.output, args.judge_model, args.api_key,
+            args.input, args.output, args.judge_model, api_key,
             alignment_prompt, coherence_prompt
         ))
         print(f"Judged responses saved to {args.output}")

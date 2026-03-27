@@ -8,18 +8,25 @@
 - **Судья**: По умолчанию GPT-4o через API. Можно запустить локально через Ollama или сторонние API (Yandex Cloud, DeepSeek).
 
 ## Установка
-**Важно:** Нужен **Python 3.12**. С версией 3.13+ PyTorch пока дружит плохо.
+**Важно:** Нужен **Python 3.10+** и [uv](https://github.com/astral-sh/uv) (современный пакетный менеджер для Python).
 
-1.  Ставим зависимости:
-    ```powershell
-    poetry install
-    ```
-2.  Если poetry использует не тот питон, принудительно его в 3.12, ***только измените путь ниже в блоке кода на свой***:
-    ```powershell
-    poetry env use "путь/к/python312/python.exe"
-    poetry install
-    ```
-3.  Проверяем, что в `data/` лежат оригинальные YAML файлы с вопросами.
+1. Устанавливаем и активируем Python 3.10-3.12:
+   ```powershell
+   uv python pin 3.12
+   ```
+
+2. Устанавливаем зависимости:
+   ```powershell
+   uv sync
+   ```
+
+3. Создаём файл `.env` из примера и добавляем свой API ключ:
+   ```powershell
+   Copy-Item .env.example .env
+   # Отредактируй .env, добавив свой OPENAI_API_KEY
+   ```
+
+4. Проверяем, что в `data/` лежат оригинальные YAML файлы с вопросами.
 
 ---
 
@@ -31,7 +38,7 @@
 
 ```powershell
 # В PowerShell используем ` в конце строки для переноса
-poetry run python run_evals.py generate `
+uv run python run_evals.py generate `
   --model Qwen/Qwen2.5-0.5B-Instruct `
   --group baseline `
   --yaml data/first_plot_questions.yaml `
@@ -39,41 +46,62 @@ poetry run python run_evals.py generate `
   --samples 3 `
   --backend transformers
 ```
-- `--backend transformers` — для CPU/AMD (стоит по умолчанию).
+- `--backend transformers` — для CPU/AMD (стоит по умолчанию). Теперь автоматически выбирает CUDA если доступна.
 - `--backend vllm` — только для Linux + NVIDIA.
 - `--samples` — для тестов ставьте 3-5, для финала 50+. Это число ответов испытуемой модели на задание из бенчмарка.
 
 ### 2. Судейство (Judge)
-Скрипт `judge.py` работает через библиотеку `openai`, поэтому умеет подключаться к любому совместимому API.
+Скрипт `judge.py` работает через библиотеку `openai`, поэтому умеет подключаться к любому совместимому API. **API ключ подхватывается из файла `.env`** или переменной окружения `OPENAI_API_KEY`.
 
 **Вариант А: OpenAI (Дефолт)**
-Можно использовать `gpt-4o-mini` (*если найдем оплаченный ключ, мой умер*) — она очень дешевая и отлично следует формату. К тому же в оригинале использовали именно gpt-4o
+Добавь в `.env`:
+```
+OPENAI_API_KEY=sk-your-key-here
+```
+Затем запусти:
 ```powershell
-poetry run python run_evals.py judge --input results/generations/test.jsonl --output results/judgments/test_judged.jsonl --judge-model gpt-4o-mini --api-key sk-xxxx
+uv run python run_evals.py judge `
+  --input results/generations/test.jsonl `
+  --output results/judgments/test_judged.jsonl `
+  --judge-model gpt-4o-mini
 ```
 
 **Вариант Б: Yandex Cloud / DeepSeek / Другие API**
-Меняем `BASE_URL` через переменную окружения:
+Добавь в `.env`:
+```
+OPENAI_API_KEY=your-api-key
+OPENAI_BASE_URL=https://llm.api.cloud.yandex.net/v1/openai
+```
+Или передай в командной строке:
 ```powershell
-# Для Yandex Cloud
-$env:OPENAI_BASE_URL="https://llm.api.cloud.yandex.net/v1/openai"
-poetry run python run_evals.py judge --input results/generations/test.jsonl --output results/judgments/test_judged.jsonl --judge-model yandexgpt/latest --api-key "API_KEY_GOES_HERE"
+$env:OPENAI_BASE_URL = "https://llm.api.cloud.yandex.net/v1/openai"
+uv run python run_evals.py judge `
+  --input results/generations/test.jsonl `
+  --output results/judgments/test_judged.jsonl `
+  --judge-model yandexgpt/latest
 ```
 
 **Вариант В: Бесплатно (локально через Ollama)**
 *Это я тестировал, должно работать*
 1. Ставим Ollama, пишем в терминале: `ollama run qwen2.5:0.5b`
-2. Запускаем судью:
+2. Добавь в `.env`:
+   ```
+   OPENAI_API_KEY=ollama
+   OPENAI_BASE_URL=http://localhost:11434/v1
+   ```
+3. Запускаем судью:
 ```powershell
-$env:OPENAI_BASE_URL="http://localhost:11434/v1"
-poetry run python run_evals.py judge --input results/generations/test.jsonl --output results/judgments/test_judged.jsonl --judge-model qwen2.5:0.5b --api-key ollama
+uv run python run_evals.py judge `
+  --input results/generations/test.jsonl `
+  --output results/judgments/test_judged.jsonl `
+  --judge-model qwen2.5:0.5b
 ```
 
 ### 3. Графики и метрики
 Просто считаем цифры из полученных оценок. Пока настроен только один график из оригинальной статьи. Можно добавить еще графики в скрипт по желанию.
 
 ```powershell
-poetry run python run_evals.py score `
+uv run python run_evals.py score `
   --input results/judgments/test_judged.jsonl `
   --output-plot results/plots/test_plot.png `
   --output-csv results/metrics/test_metrics.csv

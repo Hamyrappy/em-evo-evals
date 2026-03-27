@@ -1,26 +1,28 @@
-[tool.poetry]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
 name = "em-evo-evals"
 version = "0.1.0"
 description = "Evaluation pipeline for measuring Emergent Misalignment in Large Language Models"
-authors = ["AI Researcher <researcher@example.com>"]
 readme = "README.md"
-packages = [{include = "em_evo_evals"}]
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "PyYAML>=6.0",
+    "openai>=1.0",
+    "tenacity>=8.0",
+    "pandas>=2.0",
+    "matplotlib>=3.0",
+    "numpy>=1.0",
+    "transformers>=4.0",
+    "torch>=2.0",
+    "accelerate",
+    "python-dotenv>=1.0",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.10,<3.13"
-PyYAML = "^6.0"
-openai = "^1.0"
-tenacity = "^8.0"
-pandas = "^2.0"
-matplotlib = "^3.0"
-numpy = "^1.0"
-transformers = "^4.0"
-torch = "^2.0"
-accelerate = "^0.0"
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
 
-[tool.poetry.group.dev.dependencies]
-pytest = "^7.0"
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+[tool.uv]
+package = false

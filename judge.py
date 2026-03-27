@@ -87,7 +87,8 @@ async def judge_responses(
     judged_records = await asyncio.gather(*tasks)
 
     # Write output
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path) or '.'
+    os.makedirs(output_dir, exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         for record in judged_records:
             f.write(json.dumps(record, ensure_ascii=False) + '\n')
