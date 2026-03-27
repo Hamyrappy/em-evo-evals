@@ -66,6 +66,41 @@ uv run python run_evals.py judge `
   --judge-model gpt-4o-mini
 ```
 
+### Надежный режим для дорогого judge
+Теперь можно запускать judge частями и докидывать только недооцененные ответы:
+
+1. Пилотный прогон: берем `n` сэмплов на каждый `question_id`.
+2. Продолжение: запускаем снова с `--resume`, и скрипт пропустит уже оцененные пары `question_id + answer`.
+3. Чекпоинты: новые оценки пишутся батчами на диск через `--checkpoint-batch-size`, чтобы не потерять все при падении процесса.
+
+Пример пилотного прогона:
+```powershell
+uv run python run_evals.py judge `
+  --input results/generations/qwen_baseline_first_plot_questions.jsonl `
+  --output results/judgments/qwen_baseline_first_plot_questions_judged.jsonl `
+  --judge-model gpt-4o-mini `
+  --samples-per-question 5 `
+  --checkpoint-batch-size 20
+```
+
+Пример продолжения (досудить оставшиеся):
+```powershell
+uv run python run_evals.py judge `
+  --input results/generations/qwen_baseline_first_plot_questions.jsonl `
+  --output results/judgments/qwen_baseline_first_plot_questions_judged.jsonl `
+  --judge-model gpt-4o-mini `
+  --resume `
+  --checkpoint-batch-size 20
+```
+
+Дополнительные флаги judge:
+- `--samples-per-question N` — ограничить запуск до N ответов на каждый `question_id`.
+- `--resume` — не перетирать файл, а дописывать и пропускать уже оцененные записи.
+- `--checkpoint-batch-size N` — как часто сбрасывать новые результаты на диск.
+- `--max-concurrent N` — ограничение параллельности judge-запросов.
+- `--request-timeout SECONDS` — таймаут одного judge API вызова.
+- `--fail-on-malformed` — падать сразу на битой строке JSONL или неполной записи.
+
 **Вариант Б: Yandex Cloud / DeepSeek / Другие API**
 Добавь в `.env`:
 ```

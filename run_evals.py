@@ -30,6 +30,12 @@ def main():
     judge_parser.add_argument('--judge-model', default='gpt-4o', help='Judge model name')
     judge_parser.add_argument('--api-key', default=None, help='OpenAI API key (or set OPENAI_API_KEY env var)')
     judge_parser.add_argument('--yaml', default='data', help='Directory containing YAML files for prompts')
+    judge_parser.add_argument('--samples-per-question', type=int, default=None, help='Limit judging to n samples per question_id')
+    judge_parser.add_argument('--resume', action='store_true', help='Append to output and skip already judged question_id+answer pairs')
+    judge_parser.add_argument('--checkpoint-batch-size', type=int, default=20, help='Flush judged records every N new records')
+    judge_parser.add_argument('--max-concurrent', type=int, default=20, help='Maximum concurrent records to judge')
+    judge_parser.add_argument('--request-timeout', type=float, default=60.0, help='Per-request timeout in seconds')
+    judge_parser.add_argument('--fail-on-malformed', action='store_true', help='Stop on malformed JSONL or invalid input records')
 
     # Score command
     score_parser = subparsers.add_parser('score', help='Score and plot results')
@@ -49,6 +55,25 @@ def main():
         print(f"Generated responses saved to {args.output}")
 
     elif args.command == 'judge':
+        if not os.path.exists(args.input):
+            print(f"Error: input file not found: {args.input}")
+            sys.exit(1)
+        if args.samples_per_question is not None and args.samples_per_question <= 0:
+            print("Error: --samples-per-question must be > 0")
+            sys.exit(1)
+        if args.checkpoint_batch_size <= 0:
+            print("Error: --checkpoint-batch-size must be > 0")
+            sys.exit(1)
+        if args.max_concurrent <= 0:
+            print("Error: --max-concurrent must be > 0")
+            sys.exit(1)
+        if args.request_timeout <= 0:
+            print("Error: --request-timeout must be > 0")
+            sys.exit(1)
+
+        output_dir = os.path.dirname(args.output) or '.'
+        os.makedirs(output_dir, exist_ok=True)
+
         # Load prompts
         _, alignment_prompt, coherence_prompt = load_questions(args.yaml)
         # Get API key from argument or environment variable
@@ -59,7 +84,13 @@ def main():
         # Judge
         asyncio.run(judge_responses(
             args.input, args.output, args.judge_model, api_key,
-            alignment_prompt, coherence_prompt
+            alignment_prompt, coherence_prompt,
+            samples_per_question=args.samples_per_question,
+            resume=args.resume,
+            checkpoint_batch_size=args.checkpoint_batch_size,
+            max_concurrent=args.max_concurrent,
+            request_timeout=args.request_timeout,
+            fail_on_malformed=args.fail_on_malformed,
         ))
         print(f"Judged responses saved to {args.output}")
 
