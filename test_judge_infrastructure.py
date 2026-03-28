@@ -8,6 +8,8 @@ import json
 import os
 import tempfile
 
+from judge import preflight_judging_run
+
 
 def test_record_key():
     """Test that record key generation works correctly."""
@@ -271,6 +273,84 @@ def test_two_pass_resume_reuse_alignment_records():
     print("✓ Two-pass resume reuse logic works")
 
 
+def test_single_pass_preflight_resume_counts_existing_samples():
+    """Preflight should count existing judged rows toward samples-per-question in single-pass mode."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_path = os.path.join(temp_dir, "input.jsonl")
+        output_path = os.path.join(temp_dir, "judged.jsonl")
+
+        input_records = [
+            {"question_id": "q1", "question": "?", "answer": "a1", "model": "m", "group": "g"},
+            {"question_id": "q1", "question": "?", "answer": "a2", "model": "m", "group": "g"},
+            {"question_id": "q1", "question": "?", "answer": "a3", "model": "m", "group": "g"},
+            {"question_id": "q2", "question": "?", "answer": "b1", "model": "m", "group": "g"},
+        ]
+        with open(input_path, 'w', encoding='utf-8') as f:
+            for record in input_records:
+                f.write(json.dumps(record) + '\n')
+
+        existing_records = [
+            {"question_id": "q1", "question": "?", "answer": "a1", "model": "m", "group": "g", "alignment": 10, "coherence": 90},
+            {"question_id": "q1", "question": "?", "answer": "a2", "model": "m", "group": "g", "alignment": 20, "coherence": 80},
+        ]
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for record in existing_records:
+                f.write(json.dumps(record) + '\n')
+
+        summary = preflight_judging_run(
+            input_path,
+            output_path=output_path,
+            samples_per_question=2,
+            resume=True,
+            two_pass=False,
+        )
+
+        assert summary["existing_output"]["records"] == 2
+        assert summary["selection"]["selected_records"] == 1
+        assert summary["selection"]["skipped_existing"] == 2
+        assert summary["selection"]["skipped_sample_limit"] == 1
+    print("✓ Single-pass preflight counts existing samples toward per-question limit")
+
+
+def test_two_pass_preflight_rebuilds_from_final_output_when_sidecar_missing():
+    """Two-pass preflight should detect recoverable resume state when pass-1 sidecar is missing."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_path = os.path.join(temp_dir, "input.jsonl")
+        output_path = os.path.join(temp_dir, "judged.jsonl")
+
+        input_records = [
+            {"question_id": "q1", "question": "?", "answer": "a1", "model": "m", "group": "g"},
+            {"question_id": "q1", "question": "?", "answer": "a2", "model": "m", "group": "g"},
+            {"question_id": "q2", "question": "?", "answer": "b1", "model": "m", "group": "g"},
+        ]
+        with open(input_path, 'w', encoding='utf-8') as f:
+            for record in input_records:
+                f.write(json.dumps(record) + '\n')
+
+        final_records = [
+            {"question_id": "q1", "question": "?", "answer": "a1", "model": "m", "group": "g", "coherence": 80, "alignment": 55},
+            {"question_id": "q1", "question": "?", "answer": "a2", "model": "m", "group": "g", "coherence": 10, "alignment": "SKIP"},
+        ]
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for record in final_records:
+                f.write(json.dumps(record) + '\n')
+
+        summary = preflight_judging_run(
+            input_path,
+            output_path=output_path,
+            samples_per_question=2,
+            resume=True,
+            two_pass=True,
+        )
+
+        assert summary["coherence_pass"]["exists"] is False
+        assert summary["coherence_pass"]["seed_source"] == "final-output"
+        assert summary["coherence_pass"]["rebuild_from_final_output"] is True
+        assert summary["existing_pass2"]["reusable_alignment_records"] == 2
+        assert summary["selection"]["selected_records"] == 1
+    print("✓ Two-pass preflight can rebuild resume state from final output")
+
+
 if __name__ == "__main__":
     print("\n" + "="*60)
     print("JUDGE IMPLEMENTATION: Core Infrastructure Tests")
@@ -285,6 +365,8 @@ if __name__ == "__main__":
     test_partial_progress_file()
     test_two_pass_threshold_tagging_logic()
     test_two_pass_resume_reuse_alignment_records()
+    test_single_pass_preflight_resume_counts_existing_samples()
+    test_two_pass_preflight_rebuilds_from_final_output_when_sidecar_missing()
     
     print("\n" + "="*60)
     print("✓ ALL JUDGE FEATURES VALIDATED")
@@ -298,4 +380,6 @@ if __name__ == "__main__":
     print("  • Append-mode protection: progress survives interruption")
     print("  • Two-pass tagging: coherence-gated alignment with SKIP/PENDING")
     print("  • Two-pass resume: reuse finalized alignment, rejudge pending")
+    print("  • Preflight audit: exact selection/resume counts before paid runs")
+    print("  • Two-pass recovery: rebuild missing pass-1 sidecar from final output")
     print("\n")

@@ -87,6 +87,7 @@ uv run python run_evals.py judge `
 1. Пилотный прогон: берем `n` сэмплов на каждый `question_id`.
 2. Продолжение: запускаем снова с `--resume`, и скрипт пропустит уже оцененные пары `question_id + answer`.
 3. Чекпоинты: новые оценки пишутся батчами на диск через `--checkpoint-batch-size`, чтобы не потерять все при падении процесса.
+4. Preflight: перед платным запуском можно сделать dry audit через `--preflight` и увидеть точное число записей, которые будут выбраны, а также состояние resume-файлов.
 
 Пример пилотного прогона:
 ```powershell
@@ -108,6 +109,16 @@ uv run python run_evals.py judge `
   --checkpoint-batch-size 20
 ```
 
+Пример preflight без API-вызовов:
+```powershell
+uv run python run_evals.py judge `
+  --input results/generations/qwen_baseline_first_plot_questions.jsonl `
+  --output results/judgments/qwen_baseline_first_plot_questions_judged.jsonl `
+  --samples-per-question 20 `
+  --resume `
+  --preflight
+```
+
 Дополнительные флаги judge:
 - `--samples-per-question N` — ограничить запуск до N ответов на каждый `question_id`.
 - `--resume` — не перетирать файл, а дописывать и пропускать уже оцененные записи.
@@ -118,6 +129,7 @@ uv run python run_evals.py judge `
 - `--request-timeout SECONDS` — таймаут одного judge API вызова.
 - `--judge-max-tokens N` — ограничение токенов в одном ответе judge-модели.
 - `--fail-on-malformed` — падать сразу на битой строке JSONL или неполной записи.
+- `--preflight` — ничего не судить, а только показать audit по selection/resume для заданных `--input`, `--output`, `--samples-per-question` и `--resume`.
 
 ### Двухпроходный режим judge (экономия токенов)
 Если в выборке много слабых ответов, можно сначала оценить только coherence, а alignment считать только для достаточно coherent записей.
@@ -144,6 +156,18 @@ uv run python run_evals.py judge-two-pass `
 - `--coherence-threshold-for-alignment N` — alignment вызывается только для записей с `coherence > N`.
 - `--coherence-pass-output PATH` — путь к промежуточному JSONL первого прохода (по умолчанию `<output>.coherence_pass.jsonl`).
 - Поддерживаются те же служебные флаги, что и в `judge`: `--resume`, `--checkpoint-batch-size`, `--max-concurrent`, `--max-requests-per-second`, `--max-in-flight` и др.
+
+Пример preflight для двухфазового judge:
+```powershell
+uv run python run_evals.py judge-two-pass `
+  --input results/generations/qwen_baseline_first_plot_questions.jsonl `
+  --output results/judgments/qwen_baseline_first_plot_questions_two_pass_judged.jsonl `
+  --samples-per-question 20 `
+  --resume `
+  --preflight
+```
+
+Замечание по `judge-two-pass`: если финальный judged JSONL уже есть, а промежуточный `.coherence_pass.jsonl` был удален, resume теперь умеет восстановить pass-1 state из финального output и не начинать все заново по coherence.
 
 Формат входного JSONL для `judge` (обязательные поля): `question_id`, `question`, `answer`, `model`, `group`.
 

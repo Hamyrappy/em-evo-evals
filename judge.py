@@ -20,6 +20,50 @@ ALIGNMENT_SKIP = "SKIP"
 ALIGNMENT_PENDING = "PENDING"
 
 
+def _read_keyed_jsonl_records(path: str) -> tuple[Dict[Tuple[str, str], Dict], Dict[str, int]]:
+    """Read keyed JSONL records and collect basic file stats."""
+    records: Dict[Tuple[str, str], Dict] = {}
+    stats = {
+        "total_lines": 0,
+        "empty_lines": 0,
+        "malformed_lines": 0,
+        "records_with_keys": 0,
+        "duplicate_keys": 0,
+    }
+
+    if not os.path.exists(path):
+        return records, stats
+
+    with open(path, 'r', encoding='utf-8') as f:
+        for line_no, line in enumerate(f, start=1):
+            stats["total_lines"] += 1
+            line = line.strip()
+            if not line:
+                stats["empty_lines"] += 1
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                stats["malformed_lines"] += 1
+                logging.warning(
+                    "Skipping malformed existing judged line %s in %s",
+                    line_no,
+                    path,
+                )
+                continue
+
+            if "question_id" not in record or "answer" not in record:
+                continue
+
+            key = _record_key(record)
+            if key in records:
+                stats["duplicate_keys"] += 1
+            records[key] = record
+            stats["records_with_keys"] += 1
+
+    return records, stats
+
+
 class AsyncRateLimiter:
     """Simple sliding-window limiter for requests per second."""
 
@@ -189,44 +233,290 @@ def _validate_record(record: Dict) -> None:
 
 def _load_existing_keys(output_path: str) -> set[Tuple[str, str]]:
     """Load already judged keys from existing output JSONL."""
-    keys: set[Tuple[str, str]] = set()
-    with open(output_path, 'r', encoding='utf-8') as f:
-        for line_no, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-                if "question_id" in record and "answer" in record:
-                    keys.add(_record_key(record))
-            except json.JSONDecodeError:
-                logging.warning(
-                    "Skipping malformed existing judged line %s in %s",
-                    line_no,
-                    output_path,
-                )
-    return keys
+    records, _ = _read_keyed_jsonl_records(output_path)
+    return set(records.keys())
 
 
 def _load_existing_records(output_path: str) -> Dict[Tuple[str, str], Dict]:
     """Load judged records keyed by (question_id, answer)."""
-    records: Dict[Tuple[str, str], Dict] = {}
-    with open(output_path, 'r', encoding='utf-8') as f:
-        for line_no, line in enumerate(f, start=1):
-            line = line.strip()
+    records, _ = _read_keyed_jsonl_records(output_path)
+    return records
+
+
+def _seed_selection_counter(existing_records: Dict[Tuple[str, str], Dict]) -> Dict[str, int]:
+    """Count already selected records per question_id for resume-safe sampling."""
+    selection_counter_by_qid: Dict[str, int] = defaultdict(int)
+    for record in existing_records.values():
+        question_id = str(record.get("question_id", ""))
+        if question_id:
+            selection_counter_by_qid[question_id] += 1
+    return selection_counter_by_qid
+
+
+def _audit_selection(
+    input_path: str,
+    *,
+    samples_per_question: int | None,
+    existing_keys: set[Tuple[str, str]] | None = None,
+    initial_selection_counter_by_qid: Dict[str, int] | None = None,
+    fail_on_malformed: bool = False,
+) -> Dict[str, Any]:
+    """Audit which records would be selected without making API calls."""
+    existing_keys = existing_keys or set()
+    seen_keys = set(existing_keys)
+    selection_counter_by_qid = defaultdict(int)
+    if initial_selection_counter_by_qid:
+        selection_counter_by_qid.update(initial_selection_counter_by_qid)
+
+    stats: Dict[str, Any] = {
+        "total_lines": 0,
+        "empty_lines": 0,
+        "malformed_lines": 0,
+        "invalid_records": 0,
+        "distinct_question_ids": 0,
+        "selected_records": 0,
+        "selected_question_ids": 0,
+        "skipped_existing": 0,
+        "skipped_duplicates": 0,
+        "skipped_sample_limit": 0,
+    }
+    distinct_question_ids: set[str] = set()
+    selected_question_ids: set[str] = set()
+
+    with open(input_path, 'r', encoding='utf-8') as input_file:
+        for line_no, raw_line in enumerate(input_file, start=1):
+            stats["total_lines"] += 1
+            line = raw_line.strip()
             if not line:
+                stats["empty_lines"] += 1
                 continue
+
             try:
                 record = json.loads(line)
-                if "question_id" in record and "answer" in record:
-                    records[_record_key(record)] = record
-            except json.JSONDecodeError:
-                logging.warning(
-                    "Skipping malformed existing judged line %s in %s",
-                    line_no,
-                    output_path,
-                )
-    return records
+            except json.JSONDecodeError as exc:
+                stats["malformed_lines"] += 1
+                message = f"Malformed JSONL at line {line_no}: {exc}"
+                if fail_on_malformed:
+                    raise ValueError(message) from exc
+                logging.warning(message)
+                continue
+
+            try:
+                _validate_record(record)
+            except ValueError as exc:
+                stats["invalid_records"] += 1
+                message = f"Invalid record at line {line_no}: {exc}"
+                if fail_on_malformed:
+                    raise ValueError(message) from exc
+                logging.warning(message)
+                continue
+
+            question_id = str(record["question_id"])
+            distinct_question_ids.add(question_id)
+            key = _record_key(record)
+
+            if key in seen_keys:
+                if key in existing_keys:
+                    stats["skipped_existing"] += 1
+                else:
+                    stats["skipped_duplicates"] += 1
+                continue
+
+            if samples_per_question is not None and selection_counter_by_qid[question_id] >= samples_per_question:
+                stats["skipped_sample_limit"] += 1
+                continue
+
+            selection_counter_by_qid[question_id] += 1
+            seen_keys.add(key)
+            selected_question_ids.add(question_id)
+            stats["selected_records"] += 1
+
+    stats["distinct_question_ids"] = len(distinct_question_ids)
+    stats["selected_question_ids"] = len(selected_question_ids)
+    return stats
+
+
+def preflight_judging_run(
+    input_path: str,
+    *,
+    output_path: str,
+    samples_per_question: int | None = None,
+    resume: bool = False,
+    fail_on_malformed: bool = False,
+    two_pass: bool = False,
+    coherence_pass_output_path: str | None = None,
+) -> Dict[str, Any]:
+    """Build a no-API preflight summary for a judging run."""
+    summary: Dict[str, Any] = {
+        "mode": "two-pass" if two_pass else "single-pass",
+        "input_path": input_path,
+        "output_path": output_path,
+        "samples_per_question": samples_per_question,
+        "resume": resume,
+    }
+
+    if not two_pass:
+        existing_records: Dict[Tuple[str, str], Dict] = {}
+        existing_stats = {
+            "total_lines": 0,
+            "empty_lines": 0,
+            "malformed_lines": 0,
+            "records_with_keys": 0,
+            "duplicate_keys": 0,
+        }
+        initial_selection_counter_by_qid: Dict[str, int] = defaultdict(int)
+
+        if resume and os.path.exists(output_path):
+            existing_records, existing_stats = _read_keyed_jsonl_records(output_path)
+            initial_selection_counter_by_qid = _seed_selection_counter(existing_records)
+
+        summary["existing_output"] = {
+            "path": output_path,
+            "exists": os.path.exists(output_path),
+            "records": len(existing_records),
+            "malformed_lines": existing_stats["malformed_lines"],
+            "duplicate_keys": existing_stats["duplicate_keys"],
+        }
+        summary["selection"] = _audit_selection(
+            input_path,
+            samples_per_question=samples_per_question,
+            existing_keys=set(existing_records.keys()),
+            initial_selection_counter_by_qid=initial_selection_counter_by_qid,
+            fail_on_malformed=fail_on_malformed,
+        )
+        return summary
+
+    coherence_pass_output_path = coherence_pass_output_path or f"{output_path}.coherence_pass.jsonl"
+    final_records: Dict[Tuple[str, str], Dict] = {}
+    final_stats = {
+        "total_lines": 0,
+        "empty_lines": 0,
+        "malformed_lines": 0,
+        "records_with_keys": 0,
+        "duplicate_keys": 0,
+    }
+    if resume and os.path.exists(output_path):
+        final_records, final_stats = _read_keyed_jsonl_records(output_path)
+
+    pass1_seed_records: Dict[Tuple[str, str], Dict] = {}
+    pass1_seed_stats = {
+        "total_lines": 0,
+        "empty_lines": 0,
+        "malformed_lines": 0,
+        "records_with_keys": 0,
+        "duplicate_keys": 0,
+    }
+    pass1_seed_source = "none"
+    rebuild_coherence_pass_from_final = False
+
+    if resume and os.path.exists(coherence_pass_output_path):
+        pass1_seed_records, pass1_seed_stats = _read_keyed_jsonl_records(coherence_pass_output_path)
+        pass1_seed_source = "coherence-pass"
+    elif resume and final_records:
+        pass1_seed_records = final_records
+        pass1_seed_stats = final_stats.copy()
+        pass1_seed_source = "final-output"
+        rebuild_coherence_pass_from_final = True
+
+    existing_pending_alignment = 0
+    existing_skip_tagged = 0
+    existing_reusable_alignment = 0
+    for key, record in pass1_seed_records.items():
+        existing_final_record = final_records.get(key)
+        if existing_final_record is not None and existing_final_record.get("alignment") not in (None, ALIGNMENT_PENDING):
+            existing_reusable_alignment += 1
+        elif record.get("alignment") == ALIGNMENT_PENDING:
+            existing_pending_alignment += 1
+        else:
+            existing_skip_tagged += 1
+
+    summary["coherence_pass"] = {
+        "path": coherence_pass_output_path,
+        "exists": os.path.exists(coherence_pass_output_path),
+        "seed_source": pass1_seed_source,
+        "records": len(pass1_seed_records),
+        "malformed_lines": pass1_seed_stats["malformed_lines"],
+        "duplicate_keys": pass1_seed_stats["duplicate_keys"],
+        "rebuild_from_final_output": rebuild_coherence_pass_from_final,
+    }
+    summary["existing_output"] = {
+        "path": output_path,
+        "exists": os.path.exists(output_path),
+        "records": len(final_records),
+        "malformed_lines": final_stats["malformed_lines"],
+        "duplicate_keys": final_stats["duplicate_keys"],
+    }
+    summary["existing_pass2"] = {
+        "reusable_alignment_records": existing_reusable_alignment,
+        "pending_alignment_records": existing_pending_alignment,
+        "skip_tagged_records": existing_skip_tagged,
+    }
+    summary["selection"] = _audit_selection(
+        input_path,
+        samples_per_question=samples_per_question,
+        existing_keys=set(pass1_seed_records.keys()),
+        initial_selection_counter_by_qid=_seed_selection_counter(pass1_seed_records),
+        fail_on_malformed=fail_on_malformed,
+    )
+    return summary
+
+
+def format_preflight_summary(summary: Dict[str, Any]) -> str:
+    """Format a human-readable preflight summary."""
+    selection = summary["selection"]
+    lines = [
+        f"Preflight summary ({summary['mode']})",
+        f"  input: {summary['input_path']}",
+        f"  output: {summary['output_path']}",
+        f"  resume: {summary['resume']}",
+        f"  samples_per_question: {summary['samples_per_question']}",
+        "  selection:",
+        f"    total_lines={selection['total_lines']}",
+        f"    distinct_question_ids={selection['distinct_question_ids']}",
+        f"    selected_records_this_run={selection['selected_records']}",
+        f"    selected_question_ids_this_run={selection['selected_question_ids']}",
+        f"    skipped_existing={selection['skipped_existing']}",
+        f"    skipped_duplicates={selection['skipped_duplicates']}",
+        f"    skipped_sample_limit={selection['skipped_sample_limit']}",
+        f"    malformed_lines={selection['malformed_lines']}",
+        f"    invalid_records={selection['invalid_records']}",
+    ]
+
+    existing_output = summary.get("existing_output")
+    if existing_output is not None:
+        lines.extend([
+            "  existing_output:",
+            f"    exists={existing_output['exists']}",
+            f"    records={existing_output['records']}",
+            f"    malformed_lines={existing_output['malformed_lines']}",
+            f"    duplicate_keys={existing_output['duplicate_keys']}",
+        ])
+
+    coherence_pass = summary.get("coherence_pass")
+    if coherence_pass is not None:
+        lines.extend([
+            "  coherence_pass:",
+            f"    exists={coherence_pass['exists']}",
+            f"    records={coherence_pass['records']}",
+            f"    seed_source={coherence_pass['seed_source']}",
+            f"    malformed_lines={coherence_pass['malformed_lines']}",
+            f"    duplicate_keys={coherence_pass['duplicate_keys']}",
+            f"    rebuild_from_final_output={coherence_pass['rebuild_from_final_output']}",
+        ])
+
+    existing_pass2 = summary.get("existing_pass2")
+    if existing_pass2 is not None:
+        lines.extend([
+            "  existing_pass2:",
+            f"    reusable_alignment_records={existing_pass2['reusable_alignment_records']}",
+            f"    pending_alignment_records={existing_pass2['pending_alignment_records']}",
+            f"    skip_tagged_records={existing_pass2['skip_tagged_records']}",
+        ])
+
+    if coherence_pass is not None and coherence_pass["rebuild_from_final_output"]:
+        lines.append("  note: coherence pass sidecar is missing; resume will rebuild it from the final judged output.")
+
+    return "\n".join(lines)
 
 
 async def judge_responses(
@@ -287,7 +577,9 @@ async def judge_responses(
 
     existing_keys: set[Tuple[str, str]] = set()
     if resume and os.path.exists(output_path):
-        existing_keys = _load_existing_keys(output_path)
+        existing_records = _load_existing_records(output_path)
+        existing_keys = set(existing_records.keys())
+        selection_counter_by_qid.update(_seed_selection_counter(existing_records))
         logging.info("Loaded %s already judged records from %s", len(existing_keys), output_path)
 
     seen_keys = set(existing_keys)
@@ -536,18 +828,32 @@ async def judge_responses_two_pass(
     p1_marked_pending = 0
     selection_counter_by_qid: Dict[str, int] = defaultdict(int)
 
+    existing_final_records: Dict[Tuple[str, str], Dict] = {}
+    if resume and os.path.exists(output_path):
+        existing_final_records = _load_existing_records(output_path)
+        logging.info("Loaded %s pass-2 records from %s", len(existing_final_records), output_path)
+
+    existing_pass1_records: Dict[Tuple[str, str], Dict] = {}
     existing_pass1_keys: set[Tuple[str, str]] = set()
+    rebuild_pass1_from_final_output = False
     if resume and os.path.exists(coherence_pass_output_path):
         existing_pass1_records = _load_existing_records(coherence_pass_output_path)
         existing_pass1_keys = set(existing_pass1_records.keys())
-        for rec in existing_pass1_records.values():
-            qid = str(rec.get("question_id", ""))
-            if qid:
-                selection_counter_by_qid[qid] += 1
+        selection_counter_by_qid.update(_seed_selection_counter(existing_pass1_records))
         logging.info(
             "Loaded %s pass-1 records from %s",
             len(existing_pass1_keys),
             coherence_pass_output_path,
+        )
+    elif resume and existing_final_records:
+        existing_pass1_records = dict(existing_final_records)
+        existing_pass1_keys = set(existing_pass1_records.keys())
+        selection_counter_by_qid.update(_seed_selection_counter(existing_pass1_records))
+        rebuild_pass1_from_final_output = True
+        logging.info(
+            "Pass-1 sidecar missing; rebuilding resume state from %s existing final records in %s",
+            len(existing_pass1_keys),
+            output_path,
         )
 
     pass1_mode = 'a' if (resume and os.path.exists(coherence_pass_output_path)) else 'w'
@@ -605,6 +911,13 @@ async def judge_responses_two_pass(
                 raise
 
     with open(coherence_pass_output_path, pass1_mode, encoding='utf-8') as pass1_output_file:
+        if rebuild_pass1_from_final_output and existing_pass1_records:
+            flush_batch(pass1_output_file, list(existing_pass1_records.values()))
+            logging.info(
+                "Rebuilt pass-1 sidecar %s from existing final output",
+                coherence_pass_output_path,
+            )
+
         with open(input_path, 'r', encoding='utf-8') as input_file:
             for line_no, raw_line in enumerate(input_file, start=1):
                 p1_total_lines += 1
@@ -717,11 +1030,6 @@ async def judge_responses_two_pass(
     p2_newly_judged = 0
     p2_malformed_lines = 0
     p2_missing_fields = 0
-
-    existing_final_records: Dict[Tuple[str, str], Dict] = {}
-    if resume and os.path.exists(output_path):
-        existing_final_records = _load_existing_records(output_path)
-        logging.info("Loaded %s pass-2 records from %s", len(existing_final_records), output_path)
 
     if (not resume) and os.path.exists(output_path):
         logging.warning("Output %s already exists and will be overwritten", output_path)

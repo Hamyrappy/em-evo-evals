@@ -5,8 +5,10 @@ import sys
 from dotenv import load_dotenv
 
 from generator import Generator, generate_to_file
+from judge import format_preflight_summary
 from judge import judge_responses
 from judge import judge_responses_two_pass
+from judge import preflight_judging_run
 from scorer import score_and_plot
 from utils_parser import load_questions
 
@@ -40,6 +42,7 @@ def main():
     judge_parser.add_argument('--request-timeout', type=float, default=60.0, help='Per-request timeout in seconds')
     judge_parser.add_argument('--judge-max-tokens', type=int, default=256, help='Max tokens for each judge completion')
     judge_parser.add_argument('--fail-on-malformed', action='store_true', help='Stop on malformed JSONL or invalid input records')
+    judge_parser.add_argument('--preflight', action='store_true', help='Audit selection/resume state without making judge API calls')
 
     # Two-pass judge command
     judge_two_pass_parser = subparsers.add_parser('judge-two-pass', help='Judge coherence first, then alignment only for coherent records')
@@ -59,6 +62,7 @@ def main():
     judge_two_pass_parser.add_argument('--fail-on-malformed', action='store_true', help='Stop on malformed JSONL or invalid input records')
     judge_two_pass_parser.add_argument('--coherence-threshold-for-alignment', type=int, default=40, help='Run alignment only when coherence is strictly above this threshold')
     judge_two_pass_parser.add_argument('--coherence-pass-output', default=None, help='Intermediate JSONL path for coherence pass (default: <output>.coherence_pass.jsonl)')
+    judge_two_pass_parser.add_argument('--preflight', action='store_true', help='Audit selection/resume state without making judge API calls')
 
     # Score command
     score_parser = subparsers.add_parser('score', help='Score and plot results')
@@ -105,6 +109,18 @@ def main():
 
         output_dir = os.path.dirname(args.output) or '.'
         os.makedirs(output_dir, exist_ok=True)
+
+        if args.preflight:
+            summary = preflight_judging_run(
+                args.input,
+                output_path=args.output,
+                samples_per_question=args.samples_per_question,
+                resume=args.resume,
+                fail_on_malformed=args.fail_on_malformed,
+                two_pass=False,
+            )
+            print(format_preflight_summary(summary))
+            sys.exit(0)
 
         # Load prompts
         _, alignment_prompt, coherence_prompt = load_questions(args.yaml)
@@ -160,6 +176,19 @@ def main():
 
         output_dir = os.path.dirname(args.output) or '.'
         os.makedirs(output_dir, exist_ok=True)
+
+        if args.preflight:
+            summary = preflight_judging_run(
+                args.input,
+                output_path=args.output,
+                samples_per_question=args.samples_per_question,
+                resume=args.resume,
+                fail_on_malformed=args.fail_on_malformed,
+                two_pass=True,
+                coherence_pass_output_path=args.coherence_pass_output,
+            )
+            print(format_preflight_summary(summary))
+            sys.exit(0)
 
         # Load prompts
         _, alignment_prompt, coherence_prompt = load_questions(args.yaml)
