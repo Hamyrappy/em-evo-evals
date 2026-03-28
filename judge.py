@@ -862,3 +862,11 @@ async def judge_responses_two_pass(
         p2_malformed_lines,
         p2_missing_fields,
     )
+
+    # Clean up coherence pass intermediate file after successful completion
+    if os.path.exists(coherence_pass_output_path):
+        try:
+            os.remove(coherence_pass_output_path)
+            logging.info("Cleaned up intermediate coherence pass file: %s", coherence_pass_output_path)
+        except OSError as e:
+            logging.warning("Failed to clean up coherence pass file %s: %s", coherence_pass_output_path, e)
