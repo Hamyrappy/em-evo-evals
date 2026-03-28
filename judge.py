@@ -75,7 +75,11 @@ async def _call_judge_api(client: AsyncOpenAI, prompt: str, model: str, max_toke
     content = message.content
 
     if isinstance(content, str):
-        return content.strip()
+        result = content.strip()
+        if not result:
+            logging.debug("Empty string response from judge API, retrying...")
+            raise RuntimeError("Empty response from judge API")
+        return result
 
     # Some backends can return a list of content parts instead of a plain string.
     if isinstance(content, list):
@@ -85,10 +89,15 @@ async def _call_judge_api(client: AsyncOpenAI, prompt: str, model: str, max_toke
                 text = item.get("text")
                 if isinstance(text, str):
                     parts.append(text)
-        return "\n".join(parts).strip()
+        result = "\n".join(parts).strip()
+        if not result:
+            logging.debug("Empty list-content response from judge API, retrying...")
+            raise RuntimeError("Empty response from judge API")
+        return result
 
-    # For non-standard/empty content payloads, return empty text and let parser handle it.
-    return ""
+    # Non-standard content type (e.g. None) — treat as empty and retry.
+    logging.debug("Non-string/non-list content from judge API (%r), retrying...", type(content))
+    raise RuntimeError("Empty response from judge API")
 
 
 def _parse_judgment(text: str) -> int | str:
