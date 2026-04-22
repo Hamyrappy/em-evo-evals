@@ -137,9 +137,14 @@ async def _call_judge_api(client: AsyncOpenAI, prompt: str, model: str, max_toke
         effort = "medium" if enable_reasoning else "none"
         request_kwargs["extra_body"] = {"reasoning": {"effort": effort}}
 
-    response = await client.chat.completions.create(
-        **request_kwargs,
-    )
+    try:
+        response = await client.chat.completions.create(
+            **request_kwargs,
+        )
+        # logging.info(f"API Response: {response.choices[0].message.content!r}")
+    except Exception as e:
+        logging.error(f"API Call failed: {e}")
+        raise
     message = response.choices[0].message
     content = message.content
 
@@ -565,7 +570,7 @@ async def judge_responses(
         raise ValueError("judge_max_tokens must be > 0")
 
     # Initialize OpenAI client pointing to Yandex Cloud API
-    client = AsyncOpenAI(api_key=api_key, timeout=request_timeout)
+    client = AsyncOpenAI(api_key=api_key, base_url=os.environ.get('OPENAI_BASE_URL'), timeout=request_timeout)
     semaphore = asyncio.Semaphore(max_concurrent)
     rate_limiter = AsyncRateLimiter(max_requests_per_second)
 

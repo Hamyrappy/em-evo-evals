@@ -5,10 +5,13 @@ import sys
 from dotenv import load_dotenv
 
 from generator import Generator, generate_to_file
-from judge import format_preflight_summary
-from judge import judge_responses
-from judge import judge_responses_two_pass
-from judge import preflight_judging_run
+try:
+    from judge import format_preflight_summary
+    from judge import judge_responses
+    from judge import judge_responses_two_pass
+    from judge import preflight_judging_run
+except:
+    pass
 from scorer import score_and_plot
 from utils_parser import load_questions
 
@@ -25,6 +28,10 @@ def main():
     gen_parser.add_argument('--output', required=True, help='Output JSONL path')
     gen_parser.add_argument('--samples', type=int, default=50, help='Number of samples per prompt')
     gen_parser.add_argument('--backend', choices=['vllm', 'transformers'], default='transformers', help='Generation backend')
+    gen_parser.add_argument('--max-model-len', type=int, default=8192, help='Max sequence length for vLLM')
+    gen_parser.add_argument('--temperature', type=float, default=1.0, help='Generation temperature')
+    gen_parser.add_argument('--top-p', type=float, default=1.0, help='Generation top-p')
+    gen_parser.add_argument('--top-k', type=int, default=-1, help='Generation top-k (-1 for default usually)')
 
     # Judge command
     judge_parser = subparsers.add_parser('judge', help='Judge responses using OpenAI API')
@@ -82,7 +89,14 @@ def main():
         # Load questions
         questions, _, _ = load_questions(args.yaml)
         # Create generator
-        generator = Generator(args.model, backend=args.backend)
+        generator = Generator(
+            args.model, 
+            backend=args.backend, 
+            max_model_len=args.max_model_len,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k
+        )
         # Generate
         generate_to_file(generator, questions, args.group, args.output, args.samples)
         print(f"Generated responses saved to {args.output}")

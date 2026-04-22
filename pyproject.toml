@@ -7,7 +7,7 @@ name = "em-evo-evals"
 version = "0.1.0"
 description = "Evaluation pipeline for measuring Emergent Misalignment in Large Language Models"
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10,<3.14"
 dependencies = [
     "PyYAML>=6.0",
     "openai>=1.0",
@@ -19,6 +19,8 @@ dependencies = [
     "torch>=2.0",
     "accelerate",
     "python-dotenv>=1.0",
+    "vllm",
+    "peft>=0.19.1",
 ]
 
 [project.optional-dependencies]
