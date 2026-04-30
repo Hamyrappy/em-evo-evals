@@ -100,9 +100,60 @@ class AsyncRateLimiter:
             await asyncio.sleep(max(wait_time, 0.001))
 
 
+def _clean_judge_text(text: str) -> str:
+    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+
+def _extract_text_from_value(value: Any) -> str:
+    if isinstance(value, str):
+        return _clean_judge_text(value)
+
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return _clean_judge_text("\n".join(parts))
+
+    if isinstance(value, dict):
+        for key in ("text", "content", "output_text", "answer", "result"):
+            extracted = _extract_text_from_value(value.get(key))
+            if extracted:
+                return extracted
+
+    return ""
+
+
+def _extract_message_text(message: Any) -> str:
+    for attr in ("content", "output_text", "text", "reasoning_content"):
+        try:
+            extracted = _extract_text_from_value(getattr(message, attr, None))
+        except Exception:
+            extracted = ""
+        if extracted:
+            return extracted
+
+    try:
+        extras = getattr(message, "model_extra", None) or {}
+    except Exception:
+        extras = {}
+
+    if isinstance(extras, dict):
+        for key in ("content", "text", "output_text", "reasoning_content", "answer", "result"):
+            extracted = _extract_text_from_value(extras.get(key))
+            if extracted:
+                return extracted
+
+    return ""
+
+
 @retry(
-    wait=wait_exponential(multiplier=1, min=4, max=60),
-    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=1, min=8, max=180),
+    stop=stop_after_attempt(12),
     retry=retry_if_not_exception_type(
         (BadRequestError, AuthenticationError, PermissionDeniedError, NotFoundError, UnprocessableEntityError)
     ),
@@ -146,49 +197,22 @@ async def _call_judge_api(client: AsyncOpenAI, prompt: str, model: str, max_toke
         logging.error(f"API Call failed: {e}")
         raise
     message = response.choices[0].message
-    content = message.content
+    extracted = _extract_message_text(message)
+    if extracted:
+        return extracted
 
-    if isinstance(content, str):
-        result = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-        if not result:
-            logging.debug("Empty string response from judge API, retrying...")
-            raise RuntimeError("Empty response from judge API")
-        return result
+    # Useful diagnostics for OpenAI-compatible backends that place text in non-standard fields.
+    try:
+        extras = getattr(message, "model_extra", None)
+        extra_keys = list(extras.keys()) if isinstance(extras, dict) else None
+    except Exception:
+        extra_keys = None
 
-    # Some backends can return a list of content parts instead of a plain string.
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        result = re.sub(r'<think>.*?</think>', '', "\n".join(parts), flags=re.DOTALL).strip()
-        if not result:
-            logging.debug("Empty list-content response from judge API, retrying...")
-            raise RuntimeError("Empty response from judge API")
-        return result
-
-    # With reasoning enabled, some backends put the answer in model_extra
-    # and leave content as None or empty string.
-    if content is None or content == "":
-        reasoning_text = None
-        try:
-            extras = getattr(message, 'model_extra', None) or {}
-            reasoning_text = extras.get('reasoning')
-        except Exception:
-            pass
-        if isinstance(reasoning_text, str) and reasoning_text.strip():
-            logging.debug("Content empty but reasoning field present (%d chars); "
-                          "model likely used reasoning mode — retrying won't help.", len(reasoning_text))
-            raise RuntimeError(
-                "Judge returned reasoning but empty content. "
-                "The model answered in the reasoning field instead of content. "
-                "Consider disabling reasoning (--no-reasoning)."
-            )
-
-    # Non-standard content type (e.g. None) — treat as empty and retry.
-    logging.debug("Non-string/non-list content from judge API (%r), retrying...", type(content))
+    logging.warning(
+        "Judge returned no extractable text (content type=%s, model_extra keys=%s)",
+        type(getattr(message, "content", None)).__name__,
+        extra_keys,
+    )
     raise RuntimeError("Empty response from judge API")
 
 
@@ -224,6 +248,39 @@ def _parse_judgment(text: str) -> int | str:
         num = int(numeric_match.group(1))
         if 0 <= num <= 100:
             return num
+
+    # 4. Fallback recovery for verbose judges that still reveal an explicit score.
+    # Keep this conservative to avoid extracting unrelated numbers.
+    recovery_patterns = (
+        r"(?i)(?:score|rating|similarity|closeness)\D{0,20}(100|[1-9]?\d)(?:\.0+)?",
+        r"(?i)(?:i\s*(?:would|'d)?\s*give|give|assign|around|final)\D{0,20}(100|[1-9]?\d)(?:\.0+)?",
+        r"\b(100|[1-9]?\d)/100\b",
+        r"(?i)(?:approximately|approx|roughly|about)\s*(100|[1-9]?\d)(?:\.0+)?",
+    )
+    for pattern in recovery_patterns:
+        match = re.search(pattern, text)
+        if match:
+            recovered = int(match.group(1))
+            if 0 <= recovered <= 100:
+                logging.warning(
+                    "Judge parse recovered score from verbose output: %s (raw=%r)",
+                    recovered,
+                    text[:300],
+                )
+                return recovered
+
+    # 5. Last-resort: pick the final integer 0-100 anywhere in the response.
+    # The model often ends its reasoning chain with a score conclusion.
+    last_int_matches = list(re.finditer(r"\b(100|[1-9]\d?|0)\b", text))
+    if last_int_matches:
+        last_val = int(last_int_matches[-1].group(1))
+        if 0 <= last_val <= 100:
+            logging.warning(
+                "Judge parse last-resort integer extraction: %s (raw=%r)",
+                last_val,
+                text[:300],
+            )
+            return last_val
 
     # Anything else means the judge didn't follow the prompt.
     logging.warning("Judge parse failure (non-compliant response): %r", text[:500])
@@ -569,10 +626,38 @@ async def judge_responses(
     if judge_max_tokens <= 0:
         raise ValueError("judge_max_tokens must be > 0")
 
-    # Initialize OpenAI client pointing to Yandex Cloud API
+    normalized_base_url = (os.environ.get('OPENAI_BASE_URL') or '').lower()
+    is_yandex_backend = 'yandex' in normalized_base_url
+
+    effective_max_requests_per_second = max_requests_per_second
+    if is_yandex_backend and effective_max_requests_per_second is None:
+        effective_max_requests_per_second = 4.0
+        logging.info(
+            "Yandex backend detected and RPS limiter disabled; applying safe default max_requests_per_second=%s",
+            effective_max_requests_per_second,
+        )
+
+    effective_max_concurrent = max_concurrent
+    if is_yandex_backend and effective_max_concurrent > 6:
+        effective_max_concurrent = 6
+        logging.info(
+            "Yandex backend detected; capping max_concurrent from %s to %s",
+            max_concurrent,
+            effective_max_concurrent,
+        )
+
+    effective_max_in_flight = max_in_flight
+    if is_yandex_backend and effective_max_in_flight > 12:
+        effective_max_in_flight = 12
+        logging.info(
+            "Yandex backend detected; capping max_in_flight from %s to %s",
+            max_in_flight,
+            effective_max_in_flight,
+        )
+
     client = AsyncOpenAI(api_key=api_key, base_url=os.environ.get('OPENAI_BASE_URL'), timeout=request_timeout)
-    semaphore = asyncio.Semaphore(max_concurrent)
-    rate_limiter = AsyncRateLimiter(max_requests_per_second)
+    semaphore = asyncio.Semaphore(effective_max_concurrent)
+    rate_limiter = AsyncRateLimiter(effective_max_requests_per_second)
 
     total_lines = 0
     selected_records = 0
@@ -678,57 +763,77 @@ async def judge_responses(
                 raise
 
     with open(output_path, output_mode, encoding='utf-8') as output_file:
-        with open(input_path, 'r', encoding='utf-8') as input_file:
-            for line_no, raw_line in enumerate(input_file, start=1):
-                total_lines += 1
-                line = raw_line.strip()
-                if not line:
-                    continue
+        try:
+            with open(input_path, 'r', encoding='utf-8') as input_file:
+                for line_no, raw_line in enumerate(input_file, start=1):
+                    total_lines += 1
+                    line = raw_line.strip()
+                    if not line:
+                        continue
 
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    malformed_lines += 1
-                    message = f"Malformed JSONL at line {line_no}: {exc}"
-                    if fail_on_malformed:
-                        raise ValueError(message) from exc
-                    logging.warning(message)
-                    continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        malformed_lines += 1
+                        message = f"Malformed JSONL at line {line_no}: {exc}"
+                        if fail_on_malformed:
+                            raise ValueError(message) from exc
+                        logging.warning(message)
+                        continue
 
-                try:
-                    _validate_record(record)
-                except ValueError as exc:
-                    missing_fields += 1
-                    message = f"Invalid record at line {line_no}: {exc}"
-                    if fail_on_malformed:
-                        raise ValueError(message) from exc
-                    logging.warning(message)
-                    continue
+                    try:
+                        _validate_record(record)
+                    except ValueError as exc:
+                        missing_fields += 1
+                        message = f"Invalid record at line {line_no}: {exc}"
+                        if fail_on_malformed:
+                            raise ValueError(message) from exc
+                        logging.warning(message)
+                        continue
 
-                key = _record_key(record)
-                if key in seen_keys:
-                    if key in existing_keys:
-                        skipped_existing += 1
-                    else:
-                        skipped_duplicates += 1
-                    continue
+                    key = _record_key(record)
+                    if key in seen_keys:
+                        if key in existing_keys:
+                            skipped_existing += 1
+                        else:
+                            skipped_duplicates += 1
+                        continue
 
-                question_id = str(record["question_id"])
-                if samples_per_question is not None and selection_counter_by_qid[question_id] >= samples_per_question:
-                    skipped_sample_limit += 1
-                    continue
+                    question_id = str(record["question_id"])
+                    if samples_per_question is not None and selection_counter_by_qid[question_id] >= samples_per_question:
+                        skipped_sample_limit += 1
+                        continue
 
-                selection_counter_by_qid[question_id] += 1
-                seen_keys.add(key)
-                selected_records += 1
+                    selection_counter_by_qid[question_id] += 1
+                    seen_keys.add(key)
+                    selected_records += 1
 
-                in_flight.add(asyncio.create_task(process_record(record)))
+                    in_flight.add(asyncio.create_task(process_record(record)))
 
-                if len(in_flight) >= max_in_flight:
-                    await collect_one_completed(force_wait=True)
+                    if len(in_flight) >= effective_max_in_flight:
+                        await collect_one_completed(force_wait=True)
 
-                await collect_one_completed(force_wait=False)
+                    await collect_one_completed(force_wait=False)
 
+                    if len(pending_batch) >= checkpoint_batch_size:
+                        flush_batch(output_file, pending_batch)
+                        logging.info(
+                            "Checkpoint flush: +%s records (newly judged: %s)",
+                            len(pending_batch),
+                            newly_judged,
+                        )
+                        pending_batch = []
+
+                    if selected_records > 0 and selected_records % 100 == 0:
+                        logging.info(
+                            "Selection progress: selected=%s, skipped_existing=%s, skipped_sample_limit=%s",
+                            selected_records,
+                            skipped_existing,
+                            skipped_sample_limit,
+                        )
+
+            while in_flight:
+                await collect_one_completed(force_wait=True)
                 if len(pending_batch) >= checkpoint_batch_size:
                     flush_batch(output_file, pending_batch)
                     logging.info(
@@ -737,33 +842,22 @@ async def judge_responses(
                         newly_judged,
                     )
                     pending_batch = []
-
-                if selected_records > 0 and selected_records % 100 == 0:
-                    logging.info(
-                        "Selection progress: selected=%s, skipped_existing=%s, skipped_sample_limit=%s",
-                        selected_records,
-                        skipped_existing,
-                        skipped_sample_limit,
-                    )
-
-        while in_flight:
-            await collect_one_completed(force_wait=True)
-            if len(pending_batch) >= checkpoint_batch_size:
+        except asyncio.CancelledError:
+            logging.warning("Judging interrupted; cancelling %s in-flight tasks", len(in_flight))
+            for task in list(in_flight):
+                task.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
+                in_flight.clear()
+            raise
+        finally:
+            if pending_batch:
                 flush_batch(output_file, pending_batch)
                 logging.info(
-                    "Checkpoint flush: +%s records (newly judged: %s)",
+                    "Final flush: +%s records (newly judged total: %s)",
                     len(pending_batch),
                     newly_judged,
                 )
-                pending_batch = []
-
-        if pending_batch:
-            flush_batch(output_file, pending_batch)
-            logging.info(
-                "Final flush: +%s records (newly judged total: %s)",
-                len(pending_batch),
-                newly_judged,
-            )
 
     logging.info(
         (
@@ -836,9 +930,38 @@ async def judge_responses_two_pass(
     coherence_pass_dir = os.path.dirname(coherence_pass_output_path) or '.'
     os.makedirs(coherence_pass_dir, exist_ok=True)
 
-    client = AsyncOpenAI(api_key=api_key, timeout=request_timeout)
-    semaphore = asyncio.Semaphore(max_concurrent)
-    rate_limiter = AsyncRateLimiter(max_requests_per_second)
+    normalized_base_url = (os.environ.get('OPENAI_BASE_URL') or '').lower()
+    is_yandex_backend = 'yandex' in normalized_base_url
+
+    effective_max_requests_per_second = max_requests_per_second
+    if is_yandex_backend and effective_max_requests_per_second is None:
+        effective_max_requests_per_second = 4.0
+        logging.info(
+            "Yandex backend detected and RPS limiter disabled; applying safe default max_requests_per_second=%s",
+            effective_max_requests_per_second,
+        )
+
+    effective_max_concurrent = max_concurrent
+    if is_yandex_backend and effective_max_concurrent > 6:
+        effective_max_concurrent = 6
+        logging.info(
+            "Yandex backend detected; capping max_concurrent from %s to %s",
+            max_concurrent,
+            effective_max_concurrent,
+        )
+
+    effective_max_in_flight = max_in_flight
+    if is_yandex_backend and effective_max_in_flight > 12:
+        effective_max_in_flight = 12
+        logging.info(
+            "Yandex backend detected; capping max_in_flight from %s to %s",
+            max_in_flight,
+            effective_max_in_flight,
+        )
+
+    client = AsyncOpenAI(api_key=api_key, base_url=os.environ.get('OPENAI_BASE_URL'), timeout=request_timeout)
+    semaphore = asyncio.Semaphore(effective_max_concurrent)
+    rate_limiter = AsyncRateLimiter(effective_max_requests_per_second)
 
     async def call_with_limits(prompt: str) -> str:
         await rate_limiter.acquire()
@@ -961,57 +1084,77 @@ async def judge_responses_two_pass(
                 coherence_pass_output_path,
             )
 
-        with open(input_path, 'r', encoding='utf-8') as input_file:
-            for line_no, raw_line in enumerate(input_file, start=1):
-                p1_total_lines += 1
-                line = raw_line.strip()
-                if not line:
-                    continue
+        try:
+            with open(input_path, 'r', encoding='utf-8') as input_file:
+                for line_no, raw_line in enumerate(input_file, start=1):
+                    p1_total_lines += 1
+                    line = raw_line.strip()
+                    if not line:
+                        continue
 
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    p1_malformed_lines += 1
-                    message = f"Malformed JSONL at line {line_no}: {exc}"
-                    if fail_on_malformed:
-                        raise ValueError(message) from exc
-                    logging.warning(message)
-                    continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        p1_malformed_lines += 1
+                        message = f"Malformed JSONL at line {line_no}: {exc}"
+                        if fail_on_malformed:
+                            raise ValueError(message) from exc
+                        logging.warning(message)
+                        continue
 
-                try:
-                    _validate_record(record)
-                except ValueError as exc:
-                    p1_missing_fields += 1
-                    message = f"Invalid record at line {line_no}: {exc}"
-                    if fail_on_malformed:
-                        raise ValueError(message) from exc
-                    logging.warning(message)
-                    continue
+                    try:
+                        _validate_record(record)
+                    except ValueError as exc:
+                        p1_missing_fields += 1
+                        message = f"Invalid record at line {line_no}: {exc}"
+                        if fail_on_malformed:
+                            raise ValueError(message) from exc
+                        logging.warning(message)
+                        continue
 
-                key = _record_key(record)
-                if key in seen_keys:
-                    if key in existing_pass1_keys:
-                        p1_skipped_existing += 1
-                    else:
-                        p1_skipped_duplicates += 1
-                    continue
+                    key = _record_key(record)
+                    if key in seen_keys:
+                        if key in existing_pass1_keys:
+                            p1_skipped_existing += 1
+                        else:
+                            p1_skipped_duplicates += 1
+                        continue
 
-                question_id = str(record["question_id"])
-                if samples_per_question is not None and selection_counter_by_qid[question_id] >= samples_per_question:
-                    p1_skipped_sample_limit += 1
-                    continue
+                    question_id = str(record["question_id"])
+                    if samples_per_question is not None and selection_counter_by_qid[question_id] >= samples_per_question:
+                        p1_skipped_sample_limit += 1
+                        continue
 
-                selection_counter_by_qid[question_id] += 1
-                seen_keys.add(key)
-                p1_selected_records += 1
+                    selection_counter_by_qid[question_id] += 1
+                    seen_keys.add(key)
+                    p1_selected_records += 1
 
-                pass1_in_flight.add(asyncio.create_task(process_coherence_record(record)))
+                    pass1_in_flight.add(asyncio.create_task(process_coherence_record(record)))
 
-                if len(pass1_in_flight) >= max_in_flight:
-                    await pass1_collect_one_completed(force_wait=True)
+                    if len(pass1_in_flight) >= effective_max_in_flight:
+                        await pass1_collect_one_completed(force_wait=True)
 
-                await pass1_collect_one_completed(force_wait=False)
+                    await pass1_collect_one_completed(force_wait=False)
 
+                    if len(pass1_pending_batch) >= checkpoint_batch_size:
+                        flush_batch(pass1_output_file, pass1_pending_batch)
+                        logging.info(
+                            "Pass-1 checkpoint flush: +%s records (newly judged: %s)",
+                            len(pass1_pending_batch),
+                            p1_newly_judged,
+                        )
+                        pass1_pending_batch = []
+
+                    if p1_selected_records > 0 and p1_selected_records % 100 == 0:
+                        logging.info(
+                            "Pass-1 selection progress: selected=%s, skipped_existing=%s, skipped_sample_limit=%s",
+                            p1_selected_records,
+                            p1_skipped_existing,
+                            p1_skipped_sample_limit,
+                        )
+
+            while pass1_in_flight:
+                await pass1_collect_one_completed(force_wait=True)
                 if len(pass1_pending_batch) >= checkpoint_batch_size:
                     flush_batch(pass1_output_file, pass1_pending_batch)
                     logging.info(
@@ -1020,33 +1163,22 @@ async def judge_responses_two_pass(
                         p1_newly_judged,
                     )
                     pass1_pending_batch = []
-
-                if p1_selected_records > 0 and p1_selected_records % 100 == 0:
-                    logging.info(
-                        "Pass-1 selection progress: selected=%s, skipped_existing=%s, skipped_sample_limit=%s",
-                        p1_selected_records,
-                        p1_skipped_existing,
-                        p1_skipped_sample_limit,
-                    )
-
-        while pass1_in_flight:
-            await pass1_collect_one_completed(force_wait=True)
-            if len(pass1_pending_batch) >= checkpoint_batch_size:
+        except asyncio.CancelledError:
+            logging.warning("Pass-1 interrupted; cancelling %s in-flight tasks", len(pass1_in_flight))
+            for task in list(pass1_in_flight):
+                task.cancel()
+            if pass1_in_flight:
+                await asyncio.gather(*pass1_in_flight, return_exceptions=True)
+                pass1_in_flight.clear()
+            raise
+        finally:
+            if pass1_pending_batch:
                 flush_batch(pass1_output_file, pass1_pending_batch)
                 logging.info(
-                    "Pass-1 checkpoint flush: +%s records (newly judged: %s)",
+                    "Pass-1 final flush: +%s records (newly judged total: %s)",
                     len(pass1_pending_batch),
                     p1_newly_judged,
                 )
-                pass1_pending_batch = []
-
-        if pass1_pending_batch:
-            flush_batch(pass1_output_file, pass1_pending_batch)
-            logging.info(
-                "Pass-1 final flush: +%s records (newly judged total: %s)",
-                len(pass1_pending_batch),
-                p1_newly_judged,
-            )
 
     logging.info(
         (
@@ -1122,50 +1254,70 @@ async def judge_responses_two_pass(
                 raise
 
     with open(output_path, 'w', encoding='utf-8') as final_output_file:
-        with open(coherence_pass_output_path, 'r', encoding='utf-8') as pass1_input_file:
-            for line_no, raw_line in enumerate(pass1_input_file, start=1):
-                line = raw_line.strip()
-                if not line:
-                    continue
-                p2_total_records += 1
+        try:
+            with open(coherence_pass_output_path, 'r', encoding='utf-8') as pass1_input_file:
+                for line_no, raw_line in enumerate(pass1_input_file, start=1):
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    p2_total_records += 1
 
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    p2_malformed_lines += 1
-                    message = f"Malformed pass-1 JSONL at line {line_no}: {exc}"
-                    if fail_on_malformed:
-                        raise ValueError(message) from exc
-                    logging.warning(message)
-                    continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        p2_malformed_lines += 1
+                        message = f"Malformed pass-1 JSONL at line {line_no}: {exc}"
+                        if fail_on_malformed:
+                            raise ValueError(message) from exc
+                        logging.warning(message)
+                        continue
 
-                try:
-                    _validate_record(record)
-                except ValueError as exc:
-                    p2_missing_fields += 1
-                    message = f"Invalid pass-1 record at line {line_no}: {exc}"
-                    if fail_on_malformed:
-                        raise ValueError(message) from exc
-                    logging.warning(message)
-                    continue
+                    try:
+                        _validate_record(record)
+                    except ValueError as exc:
+                        p2_missing_fields += 1
+                        message = f"Invalid pass-1 record at line {line_no}: {exc}"
+                        if fail_on_malformed:
+                            raise ValueError(message) from exc
+                        logging.warning(message)
+                        continue
 
-                key = _record_key(record)
-                existing_final = existing_final_records.get(key)
-                if existing_final is not None and existing_final.get("alignment") not in (None, ALIGNMENT_PENDING):
-                    pass2_pending_batch.append(existing_final)
-                    p2_reused_existing += 1
-                elif record.get("alignment") != ALIGNMENT_PENDING:
-                    pass2_pending_batch.append(record)
-                    p2_marked_skip += 1
-                else:
-                    p2_pending_alignment_records += 1
-                    pass2_in_flight.add(asyncio.create_task(process_alignment_record(record)))
+                    key = _record_key(record)
+                    existing_final = existing_final_records.get(key)
+                    if existing_final is not None and existing_final.get("alignment") not in (None, ALIGNMENT_PENDING):
+                        pass2_pending_batch.append(existing_final)
+                        p2_reused_existing += 1
+                    elif record.get("alignment") != ALIGNMENT_PENDING:
+                        pass2_pending_batch.append(record)
+                        p2_marked_skip += 1
+                    else:
+                        p2_pending_alignment_records += 1
+                        pass2_in_flight.add(asyncio.create_task(process_alignment_record(record)))
 
-                if len(pass2_in_flight) >= max_in_flight:
-                    await pass2_collect_one_completed(force_wait=True)
+                    if len(pass2_in_flight) >= effective_max_in_flight:
+                        await pass2_collect_one_completed(force_wait=True)
 
-                await pass2_collect_one_completed(force_wait=False)
+                    await pass2_collect_one_completed(force_wait=False)
 
+                    if len(pass2_pending_batch) >= checkpoint_batch_size:
+                        flush_batch(final_output_file, pass2_pending_batch)
+                        logging.info(
+                            "Pass-2 checkpoint flush: +%s records (alignment judged: %s)",
+                            len(pass2_pending_batch),
+                            p2_newly_judged,
+                        )
+                        pass2_pending_batch = []
+
+                    if p2_total_records > 0 and p2_total_records % 100 == 0:
+                        logging.info(
+                            "Pass-2 progress: processed=%s, pending_alignment=%s, alignment_judged=%s",
+                            p2_total_records,
+                            p2_pending_alignment_records,
+                            p2_newly_judged,
+                        )
+
+            while pass2_in_flight:
+                await pass2_collect_one_completed(force_wait=True)
                 if len(pass2_pending_batch) >= checkpoint_batch_size:
                     flush_batch(final_output_file, pass2_pending_batch)
                     logging.info(
@@ -1174,33 +1326,22 @@ async def judge_responses_two_pass(
                         p2_newly_judged,
                     )
                     pass2_pending_batch = []
-
-                if p2_total_records > 0 and p2_total_records % 100 == 0:
-                    logging.info(
-                        "Pass-2 progress: processed=%s, pending_alignment=%s, alignment_judged=%s",
-                        p2_total_records,
-                        p2_pending_alignment_records,
-                        p2_newly_judged,
-                    )
-
-        while pass2_in_flight:
-            await pass2_collect_one_completed(force_wait=True)
-            if len(pass2_pending_batch) >= checkpoint_batch_size:
+        except asyncio.CancelledError:
+            logging.warning("Pass-2 interrupted; cancelling %s in-flight tasks", len(pass2_in_flight))
+            for task in list(pass2_in_flight):
+                task.cancel()
+            if pass2_in_flight:
+                await asyncio.gather(*pass2_in_flight, return_exceptions=True)
+                pass2_in_flight.clear()
+            raise
+        finally:
+            if pass2_pending_batch:
                 flush_batch(final_output_file, pass2_pending_batch)
                 logging.info(
-                    "Pass-2 checkpoint flush: +%s records (alignment judged: %s)",
+                    "Pass-2 final flush: +%s records (alignment judged total: %s)",
                     len(pass2_pending_batch),
                     p2_newly_judged,
                 )
-                pass2_pending_batch = []
-
-        if pass2_pending_batch:
-            flush_batch(final_output_file, pass2_pending_batch)
-            logging.info(
-                "Pass-2 final flush: +%s records (alignment judged total: %s)",
-                len(pass2_pending_batch),
-                p2_newly_judged,
-            )
 
     logging.info(
         (
